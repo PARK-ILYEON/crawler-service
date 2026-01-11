@@ -1,0 +1,15 @@
+{
+  "name": "crawler-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "npx playwright install --with-deps chromium"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.49.1"
+  }
+}

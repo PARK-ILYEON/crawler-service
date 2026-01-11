@@ -4,290 +4,292 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-const DEFAULT_TIMEOUT = 60000;
-
-// 네이버 UI 잡다한 텍스트 제거용
-const STOP_PHRASES = new Set([
-  "메뉴 영역으로 바로가기",
-  "본문 영역으로 바로가기",
-  "NAVER",
-  "검색",
-  "한글 입력기",
-  "입력도구",
-  "자동완성 레이어",
-  "검색 레이어",
-  "전체삭제",
-  "도움말",
-  "이 정보가 표시된 이유",
-  "정보확인 레이어 닫기",
-  "바로가기",
-  "더보기",
-  "광고",
-]);
+// ==============================
+// 공통 유틸
+// ==============================
+function cleanText(s) {
+  return (s || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function uniq(arr) {
-  return [...new Set(arr.filter(Boolean))];
+  return [...new Set((arr || []).map((x) => cleanText(x)).filter(Boolean))];
 }
 
-function cleanText(s) {
-  if (!s) return null;
-  const t = String(s).replace(/\s+/g, " ").trim();
-  if (!t) return null;
-  if (STOP_PHRASES.has(t)) return null;
-  return t;
-}
-
-function looksLikeDateOrSchedule(t) {
-  if (!t) return false;
-  // 1/22(목), 1/5 개강, 2026.01.11 등
-  return (
-    /(\d{1,2}\s*\/\s*\d{1,2}\s*\([^)]+\))/.test(t) ||
-    /(\d{1,2}\s*\/\s*\d{1,2})/.test(t) ||
-    /(\d{4}\.\d{1,2}\.\d{1,2})/.test(t) ||
-    /(\d{1,2}월\s*\d{1,2}일)/.test(t) ||
-    /(개강|설명회|상담|마감|오픈|시작)/.test(t)
-  );
-}
-
-/**
- * "상단 큰 광고 카드" 전용 추출
- * - 페이지에서 '광고' 라벨이 포함된 컨테이너 후보를 찾고
- * - 상단(y가 가장 작은) + 큰 카드(area 큰) 우선
- * - 해당 카드 내부에서만 필드 추출
- */
+// “상단 큰 광고 카드”를 DOM에서 찾아서 필요한 필드 추출
+// - 네이버 DOM이 자주 바뀌므로 “광고” 배지 + 카드형 구조(이미지/버튼/태그/뱃지) 기준으로 최대한 방어적으로 탐색
 async function extractTopAdCard(page) {
-  return await page.evaluate(() => {
-    const STOP = new Set([
-      "메뉴 영역으로 바로가기",
-      "본문 영역으로 바로가기",
-      "NAVER",
-      "검색",
-      "한글 입력기",
-      "입력도구",
-      "자동완성 레이어",
-      "검색 레이어",
-      "전체삭제",
-      "도움말",
-      "이 정보가 표시된 이유",
-      "정보확인 레이어 닫기",
-      "바로가기",
-      "더보기",
-      "광고",
-    ]);
+  // 네이버가 늦게 뜨는 경우가 많아서 최소한 “광고” 텍스트를 기다림(없을 수도 있음)
+  // 광고가 없으면 null 반환
+  try {
+    await page.waitForSelector("text=광고", { timeout: 8000 });
+  } catch (e) {
+    // 광고 배지 자체가 없으면(또는 로딩 실패) 그냥 null
+    return null;
+  }
 
-    const clean = (s) => {
-      if (!s) return null;
-      const t = String(s).replace(/\s+/g, " ").trim();
-      if (!t) return null;
-      if (STOP.has(t)) return null;
-      return t;
-    };
+  const ad = await page.evaluate(() => {
+    const clean = (s) =>
+      (s || "")
+        .replace(/\u00A0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 
-    const isVisible = (el) => {
-      const r = el.getBoundingClientRect();
-      if (r.width < 50 || r.height < 30) return false;
-      const style = window.getComputedStyle(el);
-      if (style.visibility === "hidden" || style.display === "none") return false;
-      return true;
-    };
-
-    // 1) "광고" 라벨을 가진 요소들을 찾는다 (상단 카드 광고에 항상 존재)
+    // “광고” 배지를 가진 요소를 찾고, 그 주변에서 가장 그럴듯한 “카드 컨테이너”를 역으로 올라가며 찾는다.
     const adBadges = Array.from(document.querySelectorAll("*"))
-      .filter((el) => {
-        const t = clean(el.textContent);
-        return t === "광고";
-      })
-      .slice(0, 200); // 방어적으로 제한
+      .filter((el) => clean(el.textContent) === "광고")
+      .slice(0, 30);
 
-    // 2) 배지 주변에서 "카드 컨테이너" 후보를 만든다
-    const candidates = [];
-    for (const badge of adBadges) {
-      // 너무 바깥(div body 등)으로 올라가지 않도록, 6단계까지만 상승
-      let cur = badge;
-      for (let i = 0; i < 6 && cur; i++) {
-        cur = cur.parentElement;
-        if (!cur) break;
-        if (!isVisible(cur)) continue;
+    const scoreCard = (root) => {
+      if (!root || !(root instanceof HTMLElement)) return -1;
 
-        const rect = cur.getBoundingClientRect();
-        const area = rect.width * rect.height;
+      const text = clean(root.innerText || "");
+      if (!text) return -1;
 
-        // 큰 카드 광고는 대체로 이미지 포함
-        const img = cur.querySelector("img");
-        // 링크(광고 클릭 링크) 포함 가능성이 높음
-        const link = cur.querySelector("a[href*='adcr.naver.com'], a[href*='ad.search.naver.com'], a[href*='ad.naver.com']");
+      // 너무 큰 컨테이너(페이지 전체) 배제
+      if (text.length > 1500) return -1;
 
-        // "큰 카드" 느낌 최소 조건
-        if (area > 40000 && img) {
-          candidates.push({ el: cur, y: rect.y, area, hasLink: !!link });
+      const hasImg = !!root.querySelector("img");
+      const hasLink = !!root.querySelector("a[href]");
+      const hasButtons = root.querySelectorAll("a,button").length >= 3;
+
+      // 태그/칩/뱃지 비슷한 짧은 텍스트가 여러 개 있으면 카드일 확률↑
+      const shortTexts = Array.from(root.querySelectorAll("a,button,span,em,strong"))
+        .map((x) => clean(x.textContent))
+        .filter((t) => t && t.length >= 1 && t.length <= 10);
+
+      const shortScore = Math.min(20, new Set(shortTexts).size);
+
+      let score = 0;
+      if (hasImg) score += 3;
+      if (hasLink) score += 2;
+      if (hasButtons) score += 2;
+      score += shortScore;
+
+      // “새소식/이벤트/설명회/개강/환급/할인” 같은 문구가 있으면 가산
+      if (/[새소식|이벤트|설명회|개강|환급|할인|무료|상담]/.test(text)) score += 3;
+
+      return score;
+    };
+
+    const findBestCardFrom = (badgeEl) => {
+      let cur = badgeEl;
+      let best = null;
+      let bestScore = -1;
+
+      // 위로 최대 10단계 올라가며 “카드 컨테이너” 후보 점수 매김
+      for (let i = 0; i < 10 && cur; i++) {
+        const s = scoreCard(cur);
+        if (s > bestScore) {
+          bestScore = s;
+          best = cur;
         }
+        cur = cur.parentElement;
       }
-    }
+
+      return best;
+    };
+
+    const candidates = adBadges
+      .map((badge) => findBestCardFrom(badge))
+      .filter(Boolean);
 
     if (candidates.length === 0) return null;
 
-    // 3) 가장 상단(y가 작은) + 큰(area 큰) 후보를 고른다
-    candidates.sort((a, b) => {
-      if (Math.abs(a.y - b.y) > 20) return a.y - b.y; // 상단 우선
-      if (a.hasLink !== b.hasLink) return a.hasLink ? -1 : 1; // 링크 있으면 우선
-      return b.area - a.area; // 크면 우선
+    // 점수 가장 높은 카드 선택
+    let best = candidates[0];
+    let bestScore = scoreCard(best);
+    for (const c of candidates.slice(1)) {
+      const s = scoreCard(c);
+      if (s > bestScore) {
+        best = c;
+        bestScore = s;
+      }
+    }
+
+    const root = best;
+
+    // ---- 광고주명(상단 왼쪽 “독한관리 에듀윌 편입” 같은 라인) 추정
+    // 카드 안에서 “광고” 배지와 같은 행에 있는 텍스트가 보통 광고주명.
+    // 가장 위쪽에 위치한 굵은 텍스트/링크 텍스트를 우선.
+    const allAnchors = Array.from(root.querySelectorAll("a"))
+      .map((a) => ({
+        text: clean(a.textContent),
+        href: a.href || null,
+        rect: a.getBoundingClientRect(),
+      }))
+      .filter((x) => x.text && x.text !== "광고");
+
+    // 상단에 가까운(작은 y) anchor 우선
+    allAnchors.sort((a, b) => a.rect.top - b.rect.top);
+
+    const advertiser =
+      allAnchors.find((x) => x.text.length >= 2 && x.text.length <= 30)?.text ||
+      null;
+
+    // ---- 메인문구(카드 상단의 “새소식 …” 라인 또는 큰 제목) 추정
+    // root 내부에서 줄 단위 텍스트를 뽑아 "광고주명"과 중복/너무 짧은 것 제외하고 앞쪽 유의미한 문장 선택
+    const lines = clean(root.innerText)
+      .split("\n")
+      .map((l) => clean(l))
+      .filter(Boolean);
+
+    // 필터링: “광고”, 광고주명과 동일, 너무 짧은 라인 제거
+    const filtered = lines.filter((l) => {
+      if (!l) return false;
+      if (l === "광고") return false;
+      if (advertiser && l === advertiser) return false;
+      if (l.length < 2) return false;
+      return true;
     });
 
-    const card = candidates[0].el;
-    const cardRect = card.getBoundingClientRect();
+    // 메인문구: 보통 “새소식 …” 또는 첫 유의미한 문장
+    const headline =
+      filtered.find((l) => l.includes("새소식")) ||
+      filtered.find((l) => /설명회|개강|환급|이벤트|상담|특강/.test(l)) ||
+      filtered[0] ||
+      null;
 
-    // 4) 카드 내부 텍스트를 "위치 기반"으로 분리
-    //    - 상단(브랜드/광고주명) / 중단(메인문구) / 하단(태그/뱃지)
-    const texts = [];
-    const nodes = card.querySelectorAll("a, span, strong, em, div, p, h1, h2, h3, h4, button");
-    for (const n of nodes) {
-      if (!isVisible(n)) continue;
-      const t = clean(n.textContent);
-      if (!t) continue;
+    // ---- 일정(“1/22(목) …” 같은 날짜/요일 패턴)
+    const schedule =
+      filtered.find((l) => /\d{1,2}\/\d{1,2}\s*\(.{1,2}\)/.test(l)) ||
+      filtered.find((l) => /\d{1,2}\/\d{1,2}/.test(l)) ||
+      null;
 
-      const r = n.getBoundingClientRect();
-      // 카드 밖에 걸친 것 제거
-      const inside =
-        r.x >= cardRect.x - 2 &&
-        r.y >= cardRect.y - 2 &&
-        r.right <= cardRect.right + 2 &&
-        r.bottom <= cardRect.bottom + 2;
+    // ---- 태그(칩): 짧은 텍스트(1~8자) 다수 중 “광고/더보기/예약하기” 같은 버튼성 제외
+    const chipTexts = Array.from(root.querySelectorAll("a,button,span,em,strong"))
+      .map((el) => clean(el.textContent))
+      .filter((t) => t && t.length >= 1 && t.length <= 8);
 
-      if (!inside) continue;
+    const deny = new Set([
+      "광고",
+      "더보기",
+      "바로가기",
+      "예약하기",
+      "신청하기",
+      "자세히",
+      "안내",
+      "NAVER",
+      "검색",
+      "메뉴",
+      "본문",
+    ]);
 
-      texts.push({
-        t,
-        y: r.y,
-        x: r.x,
-        w: r.width,
-        h: r.height,
-        area: r.width * r.height,
-      });
-    }
+    const tags = Array.from(new Set(chipTexts)).filter((t) => !deny.has(t));
 
-    // 정렬(위에서 아래로)
-    texts.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+    // ---- 이벤트 뱃지(하단 컬러 박스/배지류): 보통 6~20자 정도의 강한 문구
+    // 너무 긴 본문은 제외하고, 특수 패턴(%, 개강, 환급, 이벤트 등) 위주로 수집
+    const badgeCandidates = Array.from(root.querySelectorAll("a,button,span,em,strong"))
+      .map((el) => clean(el.textContent))
+      .filter((t) => t && t.length >= 3 && t.length <= 20);
 
-    // 후보에서 중복/과다 제거 (동일 텍스트가 여러 요소에 반복되는 경우)
-    const seen = new Set();
-    const lines = [];
-    for (const item of texts) {
-      if (seen.has(item.t)) continue;
-      seen.add(item.t);
-      lines.push(item);
-      if (lines.length > 120) break;
-    }
+    const badgeKeywords = /(개강|환급|이벤트|설명회|무료|할인|%|특강|올패스|상담|체험)/;
 
-    // 광고 링크(클릭 URL): 카드 안에서 광고 링크를 우선
-    const adAnchor =
-      card.querySelector("a[href*='adcr.naver.com']") ||
-      card.querySelector("a[href*='ad.search.naver.com']") ||
-      card.querySelector("a[href*='ad.naver.com']");
+    const badges = Array.from(new Set(badgeCandidates)).filter((t) => badgeKeywords.test(t));
 
-    // 이미지
-    const imgEl = card.querySelector("img");
-    const img = imgEl?.getAttribute("src") || imgEl?.getAttribute("data-src") || null;
+    // ---- 대표 이미지(좌측 큰 이미지)
+    const img =
+      root.querySelector("img")?.getAttribute("src") ||
+      root.querySelector("img")?.getAttribute("data-src") ||
+      null;
 
-    // 메인문구: 면적 큰 텍스트(너무 긴 설명문 제외), 보통 카드 가운데 파란 제목
-    const headlineCand = lines
-      .filter((x) => x.t.length >= 6 && x.t.length <= 60)
-      .filter((x) => !x.t.includes("바로가기"))
-      .filter((x) => !/http(s)?:\/\//.test(x.t))
-      .sort((a, b) => b.area - a.area)[0]?.t || null;
-
-    // 일정: 날짜/요일/개강/설명회 키워드 포함 텍스트 중 상단 제목 아래쪽
-    const scheduleCand = lines
-      .map((x) => x.t)
-      .find((t) => {
-        return (
-          /(\d{1,2}\s*\/\s*\d{1,2}\s*\([^)]+\))/.test(t) ||
-          /(\d{1,2}\s*\/\s*\d{1,2})/.test(t) ||
-          /(\d{4}\.\d{1,2}\.\d{1,2})/.test(t) ||
-          /(\d{1,2}월\s*\d{1,2}일)/.test(t) ||
-          /(개강|설명회|상담|마감|오픈|시작)/.test(t)
-        );
-      }) || null;
-
-    // 광고주명: 카드 상단에 위치한 짧은 텍스트(브랜드 라인)
-    // - headline과 같거나 포함되면 제외
-    const advertiserCand =
-      lines
-        .filter((x) => x.t.length >= 2 && x.t.length <= 25)
-        .filter((x) => x.y < cardRect.y + cardRect.height * 0.35) // 상단 35%
-        .filter((x) => !headlineCand || (x.t !== headlineCand && !headlineCand.includes(x.t)))
-        .sort((a, b) => (a.y - b.y) || (a.x - b.x))[0]?.t || null;
-
-    // 태그: 짧고(1~10자) 반복되는 지역/카테고리 느낌의 토큰
-    // - headline/advertiser/schedule 제외
-    const exclude = new Set([headlineCand, advertiserCand, scheduleCand].filter(Boolean));
-    const tagCands = lines
-      .map((x) => x.t)
-      .filter((t) => t && t.length >= 1 && t.length <= 10)
-      .filter((t) => !exclude.has(t))
-      .filter((t) => !/^\d+$/.test(t))
-      .filter((t) => !/(원|%|할인|환급)/.test(t)) // 뱃지쪽 숫자 제거
-      .filter((t) => !STOP.has(t));
-
-    // 이벤트 뱃지: 비교적 짧은 홍보 문구(4~30자), 할인/환급/올패스/이벤트/개강 등 포함
-    const badgeCands = lines
-      .filter((x) => x.y > cardRect.y + cardRect.height * 0.45) // 하단 위주
-      .map((x) => x.t)
-      .filter((t) => t && t.length >= 4 && t.length <= 30)
-      .filter((t) => !exclude.has(t))
-      .filter((t) => /(이벤트|특가|할인|환급|올패스|설명회|상담|개강|무료|지원|합격|인강|장학|쿠폰|혜택)/.test(t));
+    // ---- 클릭 링크(가능하면 “adcr / ad.search” 계열 우선)
+    const adLink =
+      allAnchors.find((x) => /adcr\.naver\.com|ad\.search\.naver\.com|ad\.naver\.com/.test(x.href || ""))
+        ?.href ||
+      allAnchors[0]?.href ||
+      null;
 
     return {
-      advertiser: advertiserCand || null,
-      headline: headlineCand || null,
-      schedule: scheduleCand || null,
-      tags: Array.from(new Set(tagCands)).slice(0, 12),
-      badges: Array.from(new Set(badgeCands)).slice(0, 8),
-      link: adAnchor?.href || null,
+      advertiser,
+      headline,
+      schedule,
+      tags,
+      badges,
       img,
+      link: adLink,
     };
   });
+
+  if (!ad) return null;
+
+  // evaluate 결과 후처리(빈 값 제거/중복 제거)
+  return {
+    advertiser: cleanText(ad.advertiser) || null,
+    headline: cleanText(ad.headline) || null,
+    schedule: cleanText(ad.schedule) || null,
+    tags: uniq(ad.tags),
+    badges: uniq(ad.badges),
+    img: cleanText(ad.img) || null,
+    link: cleanText(ad.link) || null,
+  };
 }
 
+// ==============================
+// 라우트
+// ==============================
+
+/** 루트: 배포 확인용 */
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "crawler-service",
+    endpoints: ["/health", "/crawl", "/crawl-multi"],
+  });
+});
+
 /** 헬스체크 */
-app.get("/health", (_req, res) => {
+app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
 /**
- * 단일 키워드 크롤
+ * 단일 크롤링
  * GET /crawl?keyword=에듀윌 편입 강남
  */
 app.get("/crawl", async (req, res) => {
-  const keyword = req.query.keyword;
-  if (!keyword) return res.status(400).json({ error: "keyword is required" });
-
-  const query = String(keyword).trim();
-  const url = `https://search.naver.com/search.naver?query=${encodeURIComponent(query)}`;
+  const keyword = cleanText(req.query.keyword);
+  if (!keyword) return res.status(400).json({ success: false, error: "keyword is required" });
 
   let browser;
+  const startedAt = Date.now();
+
   try {
     browser = await chromium.launch({
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
 
-    const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-    await page.waitForTimeout(1200); // 렌더 안정화(너무 길게 X)
+    const page = await browser.newPage({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+      viewport: { width: 1365, height: 900 },
+    });
+
+    const url = `https://search.naver.com/search.naver?query=${encodeURIComponent(keyword)}`;
+
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    // 카드 광고가 JS로 늦게 뜨는 경우가 있어 조금 더 기다림
+    await page.waitForTimeout(1200);
 
     const ad = await extractTopAdCard(page);
 
     res.json({
       success: true,
-      keyword: query,
+      keyword,
       url,
-      ad,
+      ad, // 없으면 null
       crawledAt: new Date().toISOString(),
+      ms: Date.now() - startedAt,
     });
   } catch (err) {
     res.status(500).json({
       success: false,
-      keyword: String(keyword),
+      keyword,
       error: err?.message || String(err),
+      crawledAt: new Date().toISOString(),
+      ms: Date.now() - startedAt,
     });
   } finally {
     if (browser) await browser.close();
@@ -295,47 +297,52 @@ app.get("/crawl", async (req, res) => {
 });
 
 /**
- * 멀티 크롤 (학원 3개)
- * GET /crawl-multi?base=편입 강남
- * - 내부에서 [김영, 에듀윌, 해커스] + base를 붙여 각각 상단 카드 광고를 가져옴
+ * 멀티 크롤링(A안 핵심)
+ * - 베이스(편입 강남) + academies(김영,에듀윌,해커스) => 각각 “{학원} {base}”로 검색해서 카드 광고 추출
  *
- * 옵션:
- * - academies=김영,에듀윌,해커스 처럼 콤마로 override 가능
+ * GET /crawl-multi?base=편입 강남
+ * (옵션) /crawl-multi?base=편입 강남&academies=김영,에듀윌,해커스
  */
 app.get("/crawl-multi", async (req, res) => {
-  const base = req.query.base;
-  if (!base) return res.status(400).json({ error: "base is required" });
+  const base = cleanText(req.query.base || "편입 강남");
 
-  const baseQ = String(base).trim();
-  const academiesParam = req.query.academies ? String(req.query.academies) : null;
-
-  const academies = academiesParam
-    ? academiesParam.split(",").map((s) => s.trim()).filter(Boolean)
-    : ["김영", "에듀윌", "해커스"];
+  const academiesRaw = cleanText(req.query.academies || "김영,에듀윌,해커스");
+  const academies = academiesRaw
+    .split(",")
+    .map((x) => cleanText(x))
+    .filter(Boolean);
 
   let browser;
+  const startedAt = Date.now();
+
   try {
     browser = await chromium.launch({
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
 
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+      viewport: { width: 1365, height: 900 },
+    });
+
     const results = {};
+
     for (const academy of academies) {
-      const keyword = `${academy} ${baseQ}`.trim();
+      const keyword = cleanText(`${academy} ${base}`);
+      const page = await context.newPage();
+
       const url = `https://search.naver.com/search.naver?query=${encodeURIComponent(keyword)}`;
-
-      const page = await browser.newPage();
       try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
         await page.waitForTimeout(1200);
-
         const ad = await extractTopAdCard(page);
 
         results[academy] = {
           academy,
           keyword,
           url,
-          ad,
+          ad, // 카드 광고 없으면 null
         };
       } catch (e) {
         results[academy] = {
@@ -346,21 +353,25 @@ app.get("/crawl-multi", async (req, res) => {
           error: e?.message || String(e),
         };
       } finally {
-        await page.close().catch(() => {});
+        await page.close();
       }
     }
 
     res.json({
       success: true,
-      base: baseQ,
+      base,
+      academies,
       results,
       crawledAt: new Date().toISOString(),
+      ms: Date.now() - startedAt,
     });
   } catch (err) {
     res.status(500).json({
       success: false,
-      base: String(base),
+      base,
       error: err?.message || String(err),
+      crawledAt: new Date().toISOString(),
+      ms: Date.now() - startedAt,
     });
   } finally {
     if (browser) await browser.close();

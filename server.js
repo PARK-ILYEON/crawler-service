@@ -4,94 +4,79 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/**
- * ✅ 헬스 체크 (Railway / n8n 확인용)
- */
+/** 헬스체크 */
 app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true, service: "crawler-service" });
+  res.json({ ok: true });
 });
 
-/**
- * ✅ 네이버 검색 – 상단 광고 1개 크롤링
- * GET /crawl?keyword=에듀윌+편입+강남
- */
+/** 네이버 상단 광고 1개 크롤링 */
 app.get("/crawl", async (req, res) => {
-  const { keyword } = req.query;
-
+  const keyword = req.query.keyword;
   if (!keyword) {
-    return res.status(400).json({
-      error: "keyword query parameter is required",
-    });
+    return res.status(400).json({ error: "keyword is required" });
   }
 
   let browser;
-
   try {
     browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
 
-    const page = await browser.newPage({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-    });
+    const page = await browser.newPage();
 
-    const searchUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(
+    const url = `https://search.naver.com/search.naver?query=${encodeURIComponent(
       keyword
     )}`;
 
-    await page.goto(searchUrl, {
-      waitUntil: "networkidle",
-      timeout: 60000,
-    });
+    await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
 
-    /**
-     * ⚠️ 네이버 광고 DOM은 자주 바뀌므로
-     * "광고 도메인" 기준으로 최대한 방어적으로 추출
-     */
     const ad = await page.evaluate(() => {
-      const adLink = document.querySelector(
-        "a[href*='adcr.naver.com'], a[href*='ad.naver.com']"
+      // 1️⃣ "광고" 텍스트가 있는 span 찾기
+      const adLabel = Array.from(document.querySelectorAll("span")).find(
+        (el) => el.innerText.trim() === "광고"
       );
+      if (!adLabel) return null;
 
-      if (!adLink) return null;
+      // 2️⃣ 광고 카드 전체 컨테이너 추적
+      const card =
+        adLabel.closest("div")?.parentElement?.parentElement ||
+        adLabel.closest("div");
+
+      if (!card) return null;
+
+      // 3️⃣ 제목 + 링크
+      const titleAnchor = card.querySelector("a");
+      if (!titleAnchor) return null;
+
+      const title = titleAnchor.innerText.trim();
+      const link = titleAnchor.href;
+
+      // 4️⃣ 이미지 (있으면)
+      const img = card.querySelector("img")?.src || null;
 
       return {
-        title: adLink.innerText?.trim() || null,
-        link: adLink.href,
+        title,
+        link,
+        img,
       };
     });
 
     res.json({
       keyword,
-      ad,
       success: true,
+      ad,
       crawledAt: new Date().toISOString(),
     });
-  } catch (error) {
-    console.error("❌ Crawl Error:", error);
-
+  } catch (err) {
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: err.message,
     });
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    if (browser) await browser.close();
   }
 });
 
-/**
- * ✅ 서버 시작
- */
 app.listen(PORT, () => {
-  console.log(`🚀 crawler-service running on port ${PORT}`);
+  console.log(`crawler-service listening on ${PORT}`);
 });
-
